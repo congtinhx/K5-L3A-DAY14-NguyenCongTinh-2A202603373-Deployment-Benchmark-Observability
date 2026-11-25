@@ -543,7 +543,51 @@ docker compose -p k5-day14-scaling down
 
 ## Part 6: Output check_production_ready.py
 
-_(chưa làm)_
+Chạy đầy đủ (có Docker) trong `06-lab-complete/`:
+
+```bash
+cd 06-lab-complete
+pip install -r requirements.txt
+python check_production_ready.py
+```
+
+```text
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+```
+
+Một số số đo trong lần chạy: build image 115s, **image 238 MB** (< 500 MB), rate limit trả 429 sau 5 request thành công (`RATE_LIMIT_PER_MINUTE=5`) và vẫn 429 sau khi restart agent (state trong Redis), cost guard trả 402 khi budget 0.000001 USD, 17 dòng log JSON hợp lệ, SIGTERM khi đang có request → request vẫn 200 và process thoát exit code 0, `docker stop` thoát exit code 0 sau 1.3s.
+
+**Lần chạy đầu tiên chỉ đạt 5/12** do môi trường, không phải do code: (1) máy chưa có Redis cho script test (`không có REDIS_URL, redis-server hay Docker`) nên mọi `/ask` trả 503 — sửa bằng `sudo apt install -y redis-server`; (2) `docker build` lỗi `error getting credentials` vì Docker trong WSL gọi credential helper của Windows bị timeout — sửa bằng cách tắt `credsStore` trong `~/.docker/config.json`.
+
+### Thiết kế
+
+| File | Cách làm |
+|---|---|
+| `app/config.py` | Dataclass `Settings`, mọi giá trị đọc bằng `os.getenv` (`PORT`, `ENVIRONMENT`, `LOG_LEVEL`, `AGENT_API_KEY`, `REDIS_URL`, `RATE_LIMIT_PER_MINUTE`, `DAILY_BUDGET_USD`, `MONTHLY_BUDGET_USD`). `AGENT_API_KEY` không có mặc định. Nạp `.env` khi chạy local nhưng không ghi đè biến đã có |
+| `app/auth.py` | `APIKeyHeader("X-API-Key", auto_error=False)`; thiếu, sai, hoặc server chưa cấu hình key → **401** (fail closed); so sánh bằng `hmac.compare_digest` |
+| `app/redis_client.py` | `redis.from_url` không kết nối lúc import → app khởi động được khi chưa có Redis; timeout 1s; `redis_healthy()` = `PING` |
+| `app/rate_limiter.py` | Sliding window 60s bằng sorted set Redis theo hash của API key, một transaction `ZREMRANGEBYSCORE → ZADD → ZCARD → EXPIRE`; vượt thì xoá lượt vừa ghi và trả **429** + `Retry-After`; Redis lỗi → 503 |
+| `app/cost_guard.py` | `check_budget()` trước khi gọi LLM: tổng `cost:daily:YYYY-MM-DD` hoặc `cost:monthly:YYYY-MM` ≥ budget → **402**. `record_cost()` sau khi gọi: `INCRBYFLOAT` + `EXPIRE` (2 ngày / 32 ngày) nên tự reset |
+| `app/main.py` | Logger JSON (`JsonFormatter` + `json.dumps`) cho startup, mỗi request, mỗi lần gọi LLM, shutdown. `/health` luôn 200 (không kiểm Redis), `/ready` 503 khi Redis không `PING` được. `/ask`: auth → rate limit → budget → LLM → ghi chi phí. Lỗi validate → 422 gọn, lỗi bất ngờ → 500 `Internal server error` (traceback chỉ nằm trong log). Graceful shutdown qua `lifespan` + cơ chế của uvicorn, không tự đăng ký handler SIGTERM |
+| `Dockerfile` | Multi-stage: builder `pip install --prefix=/install`, runtime `python:3.11-slim` chỉ copy package + `app/` + `utils/`, user `agent` non-root, `HEALTHCHECK` gọi `/health`, `CMD ["sh","-c","exec uvicorn ... --port ${PORT:-8000} --timeout-graceful-shutdown 8"]` để uvicorn là PID 1 |
+| `docker-compose.yml` | `agent` build từ Dockerfile, `env_file .env (required: false)`, `REDIS_URL=redis://redis:6379/0`, `depends_on redis (service_healthy)`; `redis:7-alpine` có healthcheck và volume |
+| `railway.toml` / `render.yaml` | Railway: `builder = "DOCKERFILE"`, `healthcheckPath = "/health"`. Render: web `runtime: docker`, `healthCheckPath: /health`, `AGENT_API_KEY` dùng `sync: false`, `REDIS_URL` lấy từ service Key Value |
 
 ## AI log
 
@@ -553,3 +597,5 @@ _(chưa làm)_
 | 2 | Lỗi `sudo: Authentication failed` và Python 3.14 | Claude chỉ ra đang mở nhầm distro WSL khác, hướng dẫn `wsl --set-default Ubuntu-24.04` | Mở đúng Ubuntu-24.04 (user `tnh_n_l`), Python 3.12.3 |
 | 3 | `git status` báo mọi file bị modified | Nguyên nhân là CRLF (clone bằng Git Windows); sửa bằng `git config core.autocrlf true` | Chạy `git status` → working tree clean, xác nhận không sửa `check_production_ready.py` và `golden_dataset.jsonl` |
 | 4 | Nhờ Claude soạn phần trả lời Part 1, 2, 4 và 5 trong file này | Danh sách anti-pattern kèm số dòng, bảng so sánh develop/production | Tự chạy cả hai bản, output curl và log trong bài là của tôi; đã đối chiếu từng dòng code được trích với `develop/app.py`, `production/app.py`, `production/config.py` |
+| 5 | Nhờ Claude viết code Part 6 (các TODO trong `06-lab-complete/`: `app/*.py`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`) | Code đáp ứng bảng hợp đồng trong `06-lab-complete/README.md` | Tự chạy `python check_production_ready.py` đầy đủ trên máy (WSL + Docker): lần đầu 5/12 do thiếu Redis và lỗi credentials Docker, sửa môi trường rồi chạy lại đạt PASS 12/12. Không sửa `check_production_ready.py` |
+| 6 | Lỗi `error getting credentials` khi `docker build` và thiếu Redis cho script chấm | Claude hướng dẫn cài `redis-server` trong WSL và tắt `credsStore` trong `~/.docker/config.json` | `docker pull python:3.11-slim` chạy được, script chấm tự bật redis-server tạm thời |
